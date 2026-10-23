@@ -1,0 +1,217 @@
+# =====================================================================
+# DE 3: WEBSITE QUANG BA SAN PHAM (WORDPRESS)
+# Stack: WordPress + MySQL + phpMyAdmin + Nginx (reverse proxy + SSL)
+#        + Prometheus + Grafana + Loki + Promtail + cAdvisor + mysqld-exporter
+# =====================================================================
+name: wordpress-demo
+
+services:
+
+  # ---------------- CSDL MySQL (khong publish ra host) ----------------
+  db:
+    image: mysql:8.0
+    container_name: wordpress-demo-db
+    restart: unless-stopped
+    networks: [data]
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./infra/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    command: --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------------- WordPress (chay trong, khong publish) ----------------
+  wordpress:
+    image: wordpress:php8.2-apache
+    container_name: wordpress-demo-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [data, edge]
+    volumes:
+      - wp_data:/var/www/html
+    environment:
+      WORDPRESS_DB_HOST: ${WORDPRESS_DB_HOST}
+      WORDPRESS_DB_NAME: ${WORDPRESS_DB_NAME}
+      WORDPRESS_DB_USER: ${WORDPRESS_DB_USER}
+      WORDPRESS_DB_PASSWORD: ${WORDPRESS_DB_PASSWORD}
+      WORDPRESS_TABLE_PREFIX: ${WORDPRESS_TABLE_PREFIX}
+      # Quan trong: de WordPress hoat động dung sau reverse proxy HTTPS (tranh redirect loop)
+      WORDPRESS_CONFIG_EXTRA: |
+        define('FORCE_SSL_ADMIN', true);
+        if (isset($$_SERVER['HTTP_X_FORWARDED_PROTO']) && $$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+          $$_SERVER['HTTPS'] = 'on';
+        }
+        define('WP_HOME', 'https://${SITE_DOMAIN}:8443');
+        define('WP_SITEURL', 'https://${SITE_DOMAIN}:8443');
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  # ---------------- phpMyAdmin (publish 5050) ----------------
+  phpmyadmin:
+    image: phpmyadmin:5.2-apache
+    container_name: wordpress-demo-pma
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [data, edge]
+    environment:
+      PMA_HOST: ${PMA_HOST}
+      PMA_PORT: ${PMA_PORT}
+      PMA_USER: ${PMA_USER}
+      PMA_PASSWORD: ${PMA_PASSWORD}
+      UPLOAD_LIMIT: 64M
+    ports:
+      - "${VM_HOST_IP}:5050:80"
+
+  # ---------------- Nginx reverse proxy + SSL termination ----------------
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: wordpress-demo-nginx
+    restart: unless-stopped
+    depends_on: [wordpress]
+    networks: [edge, metrics]
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./infra/ssl:/etc/nginx/ssl:ro
+    ports:
+      - "${VM_HOST_IP}:8081:80"
+      - "${VM_HOST_IP}:8443:443"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/stub_status"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  # ---------------- Nginx Exporter (doc stub_status) ----------------
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:1.1
+    container_name: wordpress-demo-nginx-exporter
+    restart: unless-stopped
+    depends_on: [nginx]
+    networks: [metrics]
+    command:
+      - --nginx.scrape-uri=http://nginx:8080/stub_status
+
+  # ---------------- MySQL Exporter ----------------
+  mysqld-exporter:
+    image: prom/mysqld-exporter:v0.15.1
+    container_name: wordpress-demo-mysqld-exporter
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [data, metrics]
+    environment:
+      DATA_SOURCE_NAME: "${MYSQL_EXPORTER_USER}:${MYSQL_EXPORTER_PASSWORD}@(db:3306)/"
+
+  # ---------------- cAdvisor (metric container) ----------------
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: wordpress-demo-cadvisor
+    restart: unless-stopped
+    networks: [metrics]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+
+  # ---------------- Prometheus ----------------
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: wordpress-demo-prometheus
+    restart: unless-stopped
+    networks: [metrics]
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.console.libraries=/etc/prometheus/console_libraries
+      - --web.console.templates=/etc/prometheus/consoles
+
+  # ---------------- Grafana (publish 3001) ----------------
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: wordpress-demo-grafana
+    restart: unless-stopped
+    depends_on: [prometheus, loki]
+    networks: [metrics, logs]
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: ${GF_USERS_ALLOW_SIGN_UP}
+      GF_INSTALL_PLUGINS: ""
+    ports:
+      - "3001:3000"
+
+  # ---------------- Loki (tap trung log) ----------------
+  loki:
+    image: grafana/loki:2.9.8
+    container_name: wordpress-demo-loki
+    restart: unless-stopped
+    networks: [logs]
+    volumes:
+      - ./infra/loki/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+
+  # ---------------- Promtail (thu thap log container -> Loki) ----------------
+  promtail:
+    image: grafana/promtail:2.9.8
+    container_name: wordpress-demo-promtail
+    restart: unless-stopped
+    depends_on: [loki]
+    networks: [logs]
+    volumes:
+      - ./infra/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yml
+
+# ===================== Volumes (luu tru ben vung) =====================
+volumes:
+  db_data:
+  wp_data:
+  prom_data:
+  grafana_data:
+  loki_data:
+
+# ===================== Networks (phan tach mang) =====================
+networks:
+  edge:    # Nginx <-> WordPress <-> phpMyAdmin
+    driver: bridge
+  data:    # MySQL + WordPress + phpMyAdmin + exporter (internal)
+    driver: bridge
+    internal: true
+  metrics: # Prometheus + exporters + Grafana (internal)
+    driver: bridge
+    internal: true
+  logs:    # Loki + Promtail + Grafana (internal)
+    driver: bridge
+    internal: true

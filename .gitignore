@@ -1,0 +1,22 @@
+# Cac file chua bi mat - TUYET DOI KHONG day len GitHub
+.env
+*.key
+*.pem
+*.crt
+infra/ssl/*.key
+infra/ssl/*.crt
+infra/ssl/*.pem
+
+# Dump CSDL
+*.sql.gz
+*.dump
+db_backup/
+
+# Docker
+docker-compose.override.yml
+
+# He thong
+.DS_Store
+Thumbs.db
+*.swp
+*.log
